@@ -4,15 +4,21 @@
 A run is a set of files in the runs directory sharing a run id
 (<name>.<YYYYmmdd-HHMMSS>): .jsonl (Claude Code stream-json output), .err,
 .pid (while running), .exit, .meta and .inbox.log (delivered messages).
+
+A background session (`ds --native`) writes .native instead of .jsonl: its
+transcript belongs to Claude Code, under ~/.claude/projects, and its state comes
+from `claude agents --json`.
 """
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from glob import glob
 
 WIDTH = 160
+AGENTS = {}
 
 
 def one_line(text, width=WIDTH):
@@ -21,9 +27,54 @@ def one_line(text, width=WIDTH):
 
 
 def run_ids(runs):
-    found = [(os.path.getmtime(p), os.path.basename(p)[: -len(".jsonl")])
-             for p in glob(os.path.join(runs, "*.jsonl"))]
-    return [rid for _, rid in sorted(found, reverse=True)]
+    found = {}
+    for ext in (".jsonl", ".native"):
+        for p in glob(os.path.join(runs, "*" + ext)):
+            rid = os.path.basename(p)[: -len(ext)]
+            found[rid] = max(found.get(rid, 0), os.path.getmtime(p))
+    return [rid for rid, _ in sorted(found.items(), key=lambda kv: kv[1], reverse=True)]
+
+
+def native_record(runs, rid):
+    try:
+        with open(os.path.join(runs, rid + ".native"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def agents(claude):
+    """`claude agents --json`, once per process; None when it cannot be read."""
+    if claude not in AGENTS:
+        try:
+            done = subprocess.run([claude, "agents", "--json"],
+                                  capture_output=True, text=True, timeout=120)
+            AGENTS[claude] = json.loads(done.stdout or "[]")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            AGENTS[claude] = None
+    return AGENTS[claude]
+
+
+def native_state(record, claude):
+    listed = agents(claude)
+    if listed is None:
+        return "unknown"
+    for a in listed:
+        if a.get("sessionId") == record.get("sessionId") or (
+                record.get("id") and a.get("id") == record.get("id")):
+            return "running" if a.get("status") == "busy" else "idle"
+    return "exited"
+
+
+def claude_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def transcript_for(session):
+    if not session:
+        return None
+    hits = sorted(glob(os.path.join(claude_dir(), "projects", "*", session + ".jsonl")))
+    return hits[0] if hits else None
 
 
 def resolve(runs, ref):
@@ -71,7 +122,19 @@ def pid_alive(runs, rid):
     return True
 
 
-def info(runs, rid):
+def info(runs, rid, claude="claude"):
+    record = native_record(runs, rid)
+    if record is not None:
+        state = native_state(record, claude)
+        if state == "exited" and os.path.exists(os.path.join(runs, rid + ".timeout")):
+            state = "timeout"
+        transcript = transcript_for(record.get("sessionId"))
+        events, _ = read_events(transcript) if transcript else ([], 0)
+        tools = sum(1 for e in events if e.get("type") == "assistant"
+                    for c in content(e) if c.get("type") == "tool_use")
+        return {"state": state, "tools": tools, "result": None,
+                "session": record.get("sessionId"), "native": True,
+                "record": record, "transcript": transcript}
     events, _ = read_events(os.path.join(runs, rid + ".jsonl"))
     tools = sum(1 for e in events if e.get("type") == "assistant"
                 for c in content(e) if c.get("type") == "tool_use")
@@ -152,26 +215,39 @@ def age(path):
     return f"{s}s ago"
 
 
-def cmd_list(runs, show_all):
+def cmd_list(runs, show_all, claude="claude"):
     ids = run_ids(runs)
     if not ids:
         print(f"no runs yet in {runs}")
         return
     print(f"{'RUN':<44} {'STATE':<12} {'TOOLS':>5}  UPDATED")
     for rid in ids if show_all else ids[:15]:
-        i = info(runs, rid)
-        print(f"{rid:<44} {i['state']:<12} {i['tools']:>5}  {age(os.path.join(runs, rid + '.jsonl'))}")
+        i = info(runs, rid, claude)
+        stamp = os.path.join(runs, rid + (".native" if i.get("native") else ".jsonl"))
+        print(f"{rid:<44} {i['state']:<12} {i['tools']:>5}  {age(stamp)}")
     if not show_all and len(ids) > 15:
         print(f"... {len(ids) - 15} older runs (ds-status -a)")
 
 
-def cmd_show(runs, ref, n, follow):
+def cmd_show(runs, ref, n, follow, claude="claude"):
     runs, rid = resolve(runs, ref)
-    path = os.path.join(runs, rid + ".jsonl")
-    i = info(runs, rid)
-    print(f"{rid}  [{i['state']}]  session {i['session'] or '-'}")
-    print(f"  log {path}")
+    i = info(runs, rid, claude)
     msgs = inbox_lines(runs, rid)
+    if i.get("native"):
+        record = i["record"]
+        path = i["transcript"] or os.path.join(runs, rid + ".launch")
+        report = record.get("report") or "-"
+        try:
+            size = f"{os.path.getsize(report)} bytes"
+        except (OSError, TypeError):
+            size = "missing"
+        print(f"{rid}  [{i['state']}]  session {i['session'] or '-'}")
+        print(f"  worker {record.get('name')}  report {report} ({size})")
+        print(f"  log {path}")
+    else:
+        path = os.path.join(runs, rid + ".jsonl")
+        print(f"{rid}  [{i['state']}]  session {i['session'] or '-'}")
+        print(f"  log {path}")
     if msgs:
         print("inbox (delivered):")
         print("\n".join(msgs))
@@ -190,8 +266,13 @@ def cmd_show(runs, ref, n, follow):
         for e in events:
             for line in render(e):
                 print(line, flush=True)
-        if not pid_alive(runs, rid):
-            print(f"-- worker exited [{info(runs, rid)['state']}]")
+        if i.get("native"):
+            state = native_state(i["record"], claude)
+            if state in ("exited", "timeout"):
+                print(f"-- worker exited [{info(runs, rid, claude)['state']}]")
+                break
+        elif not pid_alive(runs, rid):
+            print(f"-- worker exited [{info(runs, rid, claude)['state']}]")
             break
 
 
@@ -209,6 +290,8 @@ def cmd_summary(runs, rid):
 def main():
     ap = argparse.ArgumentParser(prog="ds-status")
     ap.add_argument("--runs", required=True)
+    ap.add_argument("--claude", default=os.environ.get("DS_CLAUDE_BIN") or "claude",
+                    help="claude CLI used to read background sessions")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("list")
     p.add_argument("-a", "--all", action="store_true")
@@ -220,9 +303,9 @@ def main():
     p.add_argument("rid")
     a = ap.parse_args()
     if a.cmd == "list":
-        cmd_list(a.runs, a.all)
+        cmd_list(a.runs, a.all, a.claude)
     elif a.cmd == "show":
-        cmd_show(a.runs, a.ref, a.n, a.follow)
+        cmd_show(a.runs, a.ref, a.n, a.follow, a.claude)
     else:
         cmd_summary(a.runs, a.rid)
 

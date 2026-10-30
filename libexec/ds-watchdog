@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Stop a ds background worker after a wall-clock limit.
+#   ds-watchdog <seconds> <session-id> <timeout-flag>
+# The flag file is only written when the session was still busy and `claude stop`
+# succeeded, so ds-status can tell a real timeout from a normal finish.
+set -u
+seconds="$1"; id="$2"; flag="$3"
+claude_bin="${DS_CLAUDE_BIN:-claude}"
+sleep "$seconds"
+state="$("$claude_bin" agents --json 2>/dev/null | python3 -c 'import json, sys
+sid = sys.argv[1]
+try:
+    agents = json.load(sys.stdin)
+except ValueError:
+    agents = []
+for a in agents:
+    if a.get("id") == sid or a.get("sessionId") == sid:
+        print(a.get("status") or "")
+        break
+else:
+    print("gone")' "$id")"
+[ "$state" = busy ] || exit 0
+"$claude_bin" stop "$id" > /dev/null 2>&1 && : > "$flag"

@@ -10,14 +10,18 @@ DS_HOME="$(cd -P "$(dirname "$self")/.." && pwd)"
 # shellcheck source=libexec/ds-common.sh
 . "$DS_HOME/libexec/ds-common.sh"
 
+py=(python3 "$DS_HOME/libexec/ds_status.py" --runs "$DS_RUNS_DIR" --claude "${DS_CLAUDE_BIN:-claude}")
 case "${1:-}" in
-  ""|-a|--all) exec python3 "$DS_HOME/libexec/ds_status.py" --runs "$DS_RUNS_DIR" list "$@" ;;
+  ""|-a|--all) exec "${py[@]}" list "$@" ;;
   -h|--help)
     cat <<'EOF'
 Usage: ds-status                  list recent runs (-a for all)
        ds-status <worker|run> [-n N] [-f]
                                   show the last N events of a run; -f follows it live
+
+Background sessions (`ds --native`) are listed too: their state comes from
+`claude agents` and their events from the session transcript.
 EOF
     ;;
-  *) exec python3 "$DS_HOME/libexec/ds_status.py" --runs "$DS_RUNS_DIR" show "$@" ;;
+  *) exec "${py[@]}" show "$@" ;;
 esac

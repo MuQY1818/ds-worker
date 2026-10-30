@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# ds-wait — wait for a worker to go idle or exit, then print its report state and usage.
+self="$0"
+while [ -h "$self" ]; do
+  d="$(cd -P "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  case "$self" in /*) ;; *) self="$d/$self" ;; esac
+done
+DS_HOME="$(cd -P "$(dirname "$self")/.." && pwd)"
+# shellcheck source=libexec/ds-common.sh
+. "$DS_HOME/libexec/ds-common.sh"
+
+case "${1:-}" in
+  -h|--help)
+    cat <<'EOF'
+Usage: ds-wait <worker> [--poll SECS] [--max SECS]
+
+Wait until the worker has finished (idle, or gone) and then print:
+  - its state and the report it was asked to write, with the report's size;
+  - token usage and turn count from its transcript;
+  - the last thing it said.
+
+--poll  seconds between checks (default 30)
+--max   give up waiting after this many seconds (default 86400)
+EOF
+    exit 0 ;;
+esac
+[ $# -ge 1 ] || { echo "usage: ds-wait <worker> [--poll SECS] [--max SECS]" >&2; exit 2; }
+name="$1"; shift
+exec python3 "$DS_HOME/libexec/ds_wait.py" --runs "$DS_RUNS_DIR" \
+  --claude "${DS_CLAUDE_BIN:-claude}" "$name" "$@"

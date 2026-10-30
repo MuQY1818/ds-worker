@@ -13,7 +13,7 @@ for dep in claude python3 perl; do
 done
 
 mkdir -p "$bindir"
-for cmd in ds ds-say ds-status; do
+for cmd in ds ds-say ds-status ds-wait; do
   ln -sf "$here/bin/$cmd" "$bindir/$cmd"
   echo "linked $bindir/$cmd"
 done

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# apiKeyHelper for background sessions, which do not inherit the environment ds was
+# started with. It reads the token from the ds config file each time it is asked.
+#   DS_CONFIG overrides the config path (same variable the ds commands use).
+set -u
+DS_CONFIG="${DS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ds-worker/config.env}"
+token=""
+if [ -f "$DS_CONFIG" ]; then
+  token="$(
+    set -a
+    # shellcheck source=/dev/null
+    . "$DS_CONFIG" > /dev/null 2>&1
+    printf '%s' "${DS_AUTH_TOKEN:-}"
+  )"
+fi
+[ -n "$token" ] || token="${DS_AUTH_TOKEN:-}"
+if [ -z "$token" ]; then
+  printf '%s: no DS_AUTH_TOKEN in %s\n' "$(basename "$0")" "$DS_CONFIG" >&2
+  exit 1
+fi
+printf '%s' "$token"

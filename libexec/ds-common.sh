@@ -25,3 +25,29 @@ ds_die() {
   printf '%s: %s\n' "$(basename "$0")" "$*" >&2
   exit 2
 }
+
+# The claude CLI to talk to; the tests point DS_CLAUDE_BIN at a stand-in.
+ds_claude() {
+  "${DS_CLAUDE_BIN:-claude}" "$@"
+}
+
+# Is a worker of this name running? A foreground or detached `claude -p` run has
+# a live .pid file; a background session is listed by `claude agents`.
+ds_worker_running() {
+  local name="$1" p
+  for p in "$DS_RUNS_DIR/$name".*.pid; do
+    [ -f "$p" ] || continue
+    kill -0 "$(cat "$p")" 2>/dev/null && return 0
+  done
+  for p in "$DS_RUNS_DIR/$name".*.native; do
+    [ -f "$p" ] || continue
+    ds_claude agents --json 2>/dev/null | python3 -c 'import json, sys
+name = sys.argv[1]
+try:
+    agents = json.load(sys.stdin)
+except ValueError:
+    agents = []
+sys.exit(0 if any(a.get("name") == name and a.get("kind") == "background" for a in agents) else 1)' "$name" && return 0
+  done
+  return 1
+}

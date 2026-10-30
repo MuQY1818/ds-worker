@@ -3,17 +3,17 @@
 # hand it to the worker and clear the inbox.
 #   PostToolUse: the message is added to the worker's context after the tool call.
 #   Stop:        the worker is kept running so it can act on the message first.
+# On Stop it also checks that the worker wrote a report ($DS_REPORT): a missing or
+# very short report keeps the worker running, at most twice.
 event="${1:-PostToolUse}"
 cat > /dev/null   # the hook's JSON payload on stdin is not needed
 
-inbox="${DS_INBOX:-}"
-[ -n "$inbox" ] && [ -s "$inbox" ] || exit 0
+if [ -n "${DS_INBOX:-}" ] && [ -s "$DS_INBOX" ]; then
+  # Claim the inbox atomically, so a message written meanwhile waits for the next call.
+  claimed="$DS_INBOX.claimed.$$"
+  mv "$DS_INBOX" "$claimed" 2>/dev/null || exit 0
 
-# Claim the inbox atomically, so a message written meanwhile waits for the next call.
-claimed="$inbox.claimed.$$"
-mv "$inbox" "$claimed" 2>/dev/null || exit 0
-
-python3 - "$event" "$claimed" "${DS_INBOX_LOG:-}" "${DS_INBOX_HEADER:-[Message from the dispatcher]}" <<'PY'
+  python3 - "$event" "$claimed" "${DS_INBOX_LOG:-}" "${DS_INBOX_HEADER:-[Message from the dispatcher]}" <<'PY'
 import json, sys, time
 event, path, log, header = sys.argv[1:5]
 msg = open(path, encoding="utf-8").read().strip()
@@ -28,4 +28,32 @@ else:
     out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}
 print(json.dumps(out, ensure_ascii=False))
 PY
-rm -f "$claimed"
+  rm -f "$claimed"
+  exit 0
+fi
+
+# Report check: only when the worker tries to stop.
+[ "$event" = Stop ] || exit 0
+[ -n "${DS_REPORT:-}" ] || exit 0
+size=0
+if [ -f "$DS_REPORT" ]; then
+  size="$(wc -c < "$DS_REPORT")"
+  size=$((size + 0))   # wc pads its output with spaces on some systems
+fi
+[ "$size" -lt "${DS_REPORT_MIN:-300}" ] || exit 0
+
+nag="${DS_REPORT_NAG:-${DS_REPORT%.*}.nag}"
+n=0
+[ -f "$nag" ] && n="$(cat "$nag")"
+n=$((n + 0))
+[ "$n" -lt 2 ] || exit 0
+printf '%s\n' "$((n + 1))" > "$nag"
+
+python3 - "$DS_REPORT" <<'PY'
+import json, sys
+print(json.dumps({"decision": "block", "reason":
+    f"[ds] Your report {sys.argv[1]} does not exist yet or is too short. "
+    "Write it before you finish: the key commands you ran, the files you produced, "
+    "the numbers you actually got, and anything that failed or was skipped, with the reason."},
+    ensure_ascii=False))
+PY

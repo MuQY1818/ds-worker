@@ -28,11 +28,8 @@ name="$(ds_name "$1")"; shift
 if [ "$1" = - ]; then msg="$(cat)"; else msg="$*"; fi
 [ -n "$msg" ] || ds_die "empty message"
 
-running=0
-for p in "$DS_RUNS_DIR/$name".*.pid; do
-  [ -f "$p" ] && kill -0 "$(cat "$p")" 2>/dev/null && running=1
-done
-[ $running -eq 1 ] || printf 'ds-say: no running worker named %s; the message waits in its inbox\n' "$name" >&2
+ds_worker_running "$name" \
+  || printf 'ds-say: no running worker named %s; the message waits in its inbox\n' "$name" >&2
 
 mkdir -p "$DS_INBOX_DIR"
 printf '%s\n' "$msg" >> "$DS_INBOX_DIR/$name.md"

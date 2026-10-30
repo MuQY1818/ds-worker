@@ -18,17 +18,31 @@ Usage: ds <task.md> <report.md> [options]
 
 Run a headless Claude Code worker on a task sheet. The worker writes its
 report to <report.md>. Talk to it while it runs with `ds-say`, watch it
-with `ds-status`.
+with `ds-status`, wait for it to finish with `ds-wait`.
+
+Background mode: when your claude CLI has `--bg` (checked in `claude --help`),
+ds starts a Claude Code background session, which `claude agents`, `claude
+attach` and SendMessage can reach. Otherwise the worker runs in the foreground.
+Pick explicitly with --native / --no-native, or set DS_NATIVE=1|0|auto.
 
 Options:
-  --bg               run detached and return immediately
-  --name NAME        worker name for ds-say / ds-status (default: task file name)
+  --native           start a Claude Code background session (claude --bg)
+  --no-native        run in the foreground (claude -p) even if --bg exists
+  --bg               detached `claude -p`: ds returns at once and writes the
+                     stream-json transcript itself (the pre-native background mode)
+  --name NAME        worker name for ds-say / ds-wait / ds-status (default: task file name)
   --model MODEL      model id (default: $DS_MODEL)
   --effort LEVEL     low | medium | high (default: $DS_EFFORT, else high)
-  --timeout SECS     hard wall-clock limit (default: $DS_TIMEOUT, else 7200)
+  --timeout SECS     hard wall-clock limit (default: $DS_TIMEOUT, else 7200);
+                     a background session is stopped with `claude stop`
   --rules FILE       extra rules appended to the worker's system prompt
-  --resume SESSION   continue an earlier worker session; the task sheet
-                     is sent as the next message
+  --resume SESSION   continue an earlier `-p` session; the task sheet is sent
+                     as its next message (not available for background sessions)
+  --context FILE     a file the worker must read before it starts (repeatable)
+  --chat N           put the last N messages of a transcript into the worker's context
+  --chat-from FILE   transcript for --chat (default: the newest under ~/.claude/projects)
+  --clone REPO       give the worker an isolated git clone of REPO
+  --ask-to NAME      session the worker may message when a decision is needed
   -h, --help         show this help
 EOF
 }
@@ -38,18 +52,26 @@ case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 task="$1"; report="$2"; shift 2
 
 bg=0
+native_choice=auto          # auto | 1 | 0, from --native / --no-native
 name=""
 model="${DS_MODEL:-}"
 effort="${DS_EFFORT:-high}"
 timeout="${DS_TIMEOUT:-7200}"
 rules_file=""
 resume=""
+chat=0
+chat_from=""
+clone=""
+askto=""
+contexts=()
 passthru=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --bg) bg=1; shift; continue ;;
+    --native) native_choice=1; shift; continue ;;
+    --no-native) native_choice=0; shift; continue ;;
     -h|--help) usage; exit 0 ;;
-    --name|--model|--effort|--timeout|--rules|--resume)
+    --name|--model|--effort|--timeout|--rules|--resume|--context|--chat|--chat-from|--clone|--ask-to)
       [ $# -ge 2 ] || ds_die "$1 needs a value"
       case "$1" in
         --name) name="$2" ;;
@@ -58,6 +80,11 @@ while [ $# -gt 0 ]; do
         --timeout) timeout="$2" ;;
         --rules) rules_file="$2" ;;
         --resume) resume="$2" ;;
+        --context) contexts+=("$2") ;;
+        --chat) chat="$2" ;;
+        --chat-from) chat_from="$2" ;;
+        --clone) clone="$2" ;;
+        --ask-to) askto="$2" ;;
       esac
       passthru+=("$1" "$2"); shift 2 ;;
     *) ds_die "unknown option: $1 (see ds --help)" ;;
@@ -67,10 +94,45 @@ done
 [ -f "$task" ] || ds_die "task sheet not found: $task"
 case "$effort" in low|medium|high) ;; *) ds_die "--effort must be low, medium or high" ;; esac
 case "$timeout" in ''|*[!0-9]*) ds_die "--timeout must be a whole number of seconds" ;; esac
+case "$chat" in ''|*[!0-9]*) ds_die "--chat must be a whole number of messages" ;; esac
 [ -z "$rules_file" ] || [ -f "$rules_file" ] || ds_die "rules file not found: $rules_file"
 [ -z "${DS_RULES_FILE:-}" ] || [ -f "$DS_RULES_FILE" ] || ds_die "DS_RULES_FILE not found: $DS_RULES_FILE"
+[ -z "$chat_from" ] || [ -f "$chat_from" ] || ds_die "transcript not found: $chat_from"
+[ "$chat" -gt 0 ] || [ -z "$chat_from" ] || ds_die "--chat-from needs --chat"
+[ -z "$clone" ] || command -v git > /dev/null || ds_die "--clone needs git on PATH"
 if [ -n "${DS_BASE_URL:-}" ] && [ -z "${DS_AUTH_TOKEN:-}" ]; then
   ds_die "DS_BASE_URL is set but DS_AUTH_TOKEN is empty (see config.example.env)"
+fi
+for f in "${contexts[@]}"; do
+  [ -f "$f" ] || ds_die "context file not found: $f"
+done
+
+# --- which kind of worker? --------------------------------------------------
+# Native background sessions need a claude that has --bg. DS_MODE is set by the
+# detached --bg re-exec below, so the child never picks a mode on its own.
+want_native="${DS_NATIVE:-auto}"
+[ "$native_choice" = auto ] || want_native="$native_choice"
+case "$want_native" in auto|1|0) ;; *) ds_die "DS_NATIVE must be auto, 1 or 0" ;; esac
+have_bg=0
+if [ "$want_native" != 0 ]; then
+  ds_claude --help 2>/dev/null | grep -q -- '--bg' && have_bg=1
+fi
+if [ -n "${DS_MODE:-}" ]; then
+  mode="$DS_MODE"
+elif [ $bg -eq 1 ]; then
+  mode=detached
+elif [ "$want_native" = 0 ]; then
+  mode=foreground
+elif [ "$want_native" = 1 ]; then
+  [ $have_bg -eq 1 ] || ds_die '--native needs a claude CLI with --bg (try --no-native)'
+  mode=native
+elif [ $have_bg -eq 1 ]; then
+  mode=native
+else
+  mode=foreground
+fi
+if [ "$mode" = native ] && [ -n "$resume" ]; then
+  ds_die '--resume works only with the print mode; continue a background session by attaching to it'
 fi
 
 task="$(cd "$(dirname "$task")" && pwd)/$(basename "$task")"
@@ -80,10 +142,11 @@ run_id="${DS_RUN_ID:-$name.$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$DS_RUNS_DIR" "$DS_INBOX_DIR"
 log="$DS_RUNS_DIR/$run_id.jsonl"
 inbox="$DS_INBOX_DIR/$name.md"
+started="$(date +%Y%m%d-%H%M%S)"
 
-if [ $bg -eq 1 ]; then
+if [ "$mode" = detached ]; then
   rm -f "$inbox"   # messages left from an earlier run are not for this worker
-  DS_RUN_ID="$run_id" DS_KEEP_INBOX=1 nohup "$self" "$task" "$report" "${passthru[@]}" \
+  DS_MODE=foreground DS_RUN_ID="$run_id" DS_KEEP_INBOX=1 nohup "$self" "$task" "$report" "${passthru[@]}" \
     > "$DS_RUNS_DIR/$run_id.out" 2>&1 < /dev/null &
   printf 'started  %s  (run %s, pid %s)\n' "$name" "$run_id" "$!"
   printf '  log    %s\n' "$log"
@@ -92,6 +155,33 @@ if [ $bg -eq 1 ]; then
   exit 0
 fi
 [ -n "${DS_KEEP_INBOX:-}" ] || rm -f "$inbox"
+
+# --- context ----------------------------------------------------------------
+if [ "$chat" -gt 0 ]; then
+  ctx_file="$DS_RUNS_DIR/$run_id.context.md"
+  python3 "$DS_HOME/libexec/ds_chat.py" --turns "$chat" --from "$chat_from" > "$ctx_file" \
+    || ds_die "could not read the conversation"
+  contexts+=("$ctx_file")
+fi
+ctxnote=""
+if [ ${#contexts[@]} -gt 0 ]; then
+  ctx_list=""
+  for f in "${contexts[@]}"; do
+    if [ -z "$ctx_list" ]; then ctx_list="$f"; else ctx_list="$ctx_list, $f"; fi
+  done
+  ctxnote="Before you start, read these files completely; they are the background for this task: $ctx_list."
+fi
+
+# --- an isolated clone for the worker ---------------------------------------
+clonenote=""
+if [ -n "$clone" ]; then
+  cdir="$DS_RUNS_DIR/clones/$name/repo"
+  [ -e "$cdir" ] && ds_die "clone directory already exists: $cdir (pick another --name or remove it)"
+  mkdir -p "$(dirname "$cdir")" || ds_die "cannot create $(dirname "$cdir")"
+  git clone -q "$clone" "$cdir" || ds_die "git clone failed: $clone"
+  branch="$(git -C "$cdir" branch --show-current 2>/dev/null)"
+  clonenote="Your working copy is an isolated clone: $cdir (branch ${branch:-unknown}). Make changes and commit only there; leave other clones alone."
+fi
 
 rules="You are a worker executing a task sheet. Follow it; do not re-plan or widen its scope.
 1. Before you finish, write your report to: $report. List the key commands you ran, the files you produced, and anything that failed or was skipped, with the reason.
@@ -104,20 +194,125 @@ for f in "${DS_RULES_FILE:-}" "$rules_file"; do
 
 $(cat "$f")"
 done
+if [ -n "$askto" ]; then
+  rules="$rules
+
+If you need a decision that is not yours to make, send the question with SendMessage to the session named \"$askto\", say what the options are, and keep working on whatever does not depend on the answer."
+fi
 
 # Register the inbox hook: after every tool call, and when the worker tries to stop.
-settings="$(python3 - "$DS_HOME/libexec/ds-inbox-hook" <<'PY'
+# The hook's environment is written into the command itself: a background session
+# does not inherit the environment ds was started with.
+settings="$DS_RUNS_DIR/$run_id.settings.json"
+use_helper=0
+[ -n "${DS_BASE_URL:-}" ] && [ -n "${DS_AUTH_TOKEN:-}" ] && use_helper=1
+python3 - "$DS_HOME/libexec/ds-inbox-hook" "$inbox" "$report" \
+  "${DS_INBOX_HEADER:-}" "$DS_RUNS_DIR/$run_id.inbox.log" "$DS_RUNS_DIR/$run_id.nag" \
+  "$mode" "${DS_BASE_URL:-}" "$model" "$use_helper" "$DS_HOME/libexec/ds-key-helper" \
+  "$DS_CONFIG" > "$settings" <<'PY'
 import json, shlex, sys
-hook = shlex.quote(sys.argv[1])
-def cmd(event):
-    return {"type": "command", "command": f"{hook} {event}"}
-print(json.dumps({"hooks": {
-    "PostToolUse": [{"matcher": "*", "hooks": [cmd("PostToolUse")]}],
-    "Stop": [{"hooks": [cmd("Stop")]}],
-}}))
-PY
-)" || ds_die "python3 is required"
+(hook, inbox, report, header, inbox_log, nag, mode,
+ base_url, model, use_helper, helper, config) = sys.argv[1:13]
+q = shlex.quote
 
+
+def hook_cmd(event):
+    envs = ["DS_INBOX=" + q(inbox), "DS_REPORT=" + q(report), "DS_REPORT_NAG=" + q(nag)]
+    if inbox_log:
+        envs.append("DS_INBOX_LOG=" + q(inbox_log))
+    if header:
+        envs.append("DS_INBOX_HEADER=" + q(header))
+    return {"type": "command", "command": " ".join(envs) + " " + q(hook) + " " + event}
+
+
+settings = {"hooks": {
+    "PostToolUse": [{"matcher": "*", "hooks": [hook_cmd("PostToolUse")]}],
+    "Stop": [{"hooks": [hook_cmd("Stop")]}],
+}}
+if mode == "native":
+    # The session does not inherit ds's environment, so the backend goes here.
+    env = {}
+    if base_url:
+        env["ANTHROPIC_BASE_URL"] = base_url
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    if model:
+        for key in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL"):
+            env[key] = model
+    if env:
+        settings["env"] = env
+    if use_helper == "1":
+        # Never the token itself: the helper prints it when the session asks.
+        # The session does not see DS_CONFIG either, so the helper is told where it is.
+        settings["apiKeyHelper"] = "DS_CONFIG=" + q(config) + " " + q(helper)
+print(json.dumps(settings, indent=1))
+PY
+[ -s "$settings" ] || ds_die "python3 is required"
+
+# --- native background session ----------------------------------------------
+if [ "$mode" = native ]; then
+  if ds_claude agents --json 2>/dev/null | python3 -c 'import json, sys
+name = sys.argv[1]
+try:
+    agents = json.load(sys.stdin)
+except ValueError:
+    agents = []
+busy = any(a.get("name") == name and a.get("kind") == "background"
+           and a.get("status") == "busy" for a in agents)
+sys.exit(0 if busy else 1)' "$name"; then
+    ds_die "a background session named $name is still running (use --name)"
+  fi
+  prompt="Execute the task sheet $task: read it completely first, then act on it."
+  [ -z "$ctxnote$clonenote" ] || prompt="$prompt $ctxnote $clonenote"
+  launch_log="$DS_RUNS_DIR/$run_id.launch"
+  args=(--bg -n "$name" --settings "$settings"
+        --permission-mode "${DS_PERMISSION_MODE:-bypassPermissions}"
+        --effort "$effort" --append-system-prompt "$rules")
+  [ -z "$model" ] || args+=(--model "$model")
+  ds_claude "${args[@]}" "$prompt" > "$launch_log" 2>&1 < /dev/null
+  code=$?
+  cat "$launch_log"
+  [ $code -eq 0 ] || exit $code
+  id=""; session=""; i=0
+  while [ $i -lt 10 ]; do
+    found="$(ds_claude agents --json 2>/dev/null | python3 -c 'import json, sys
+name = sys.argv[1]
+try:
+    agents = json.load(sys.stdin)
+except ValueError:
+    agents = []
+for a in agents:
+    if a.get("name") == name and a.get("kind") == "background":
+        print(a.get("id") or str(a.get("sessionId") or "")[:8], a.get("sessionId") or "")
+        break' "$name")"
+    if [ -n "$found" ]; then
+      id="${found%% *}"; session="${found#* }"; break
+    fi
+    sleep 1; i=$((i + 1))
+  done
+  [ -n "$id" ] || ds_die "the session did not appear in 'claude agents' (see $launch_log)"
+  printf '%s\t%s\t%s\n' "$name" "$task" "$report" > "$DS_RUNS_DIR/$run_id.meta"
+  python3 - "$DS_RUNS_DIR/$run_id.native" "$name" "$id" "$session" "$task" "$report" "$timeout" "$started" <<'PY'
+import json, sys
+(out, name, sid, session, task, report, timeout, started) = sys.argv[1:9]
+json.dump({"mode": "native", "name": name, "id": sid, "sessionId": session,
+           "task": task, "report": report, "timeout": int(timeout),
+           "started": started}, open(out, "w"), ensure_ascii=False, indent=1)
+PY
+  nohup "$DS_HOME/libexec/ds-watchdog" "$timeout" "$id" "$DS_RUNS_DIR/$run_id.timeout" \
+    > "$DS_RUNS_DIR/$run_id.watchdog" 2>&1 < /dev/null &
+  printf 'started  %s  (background session %s)\n' "$name" "$id"
+  printf '  log    %s\n' "$launch_log"
+  printf '  report %s\n' "$report"
+  printf '  talk   ds-say %s "..."\n' "$name"
+  printf '  wait   ds-wait %s\n' "$name"
+  printf '  watch  ds-status %s -f\n' "$name"
+  printf '  attach claude attach %s\n' "$id"
+  exit 0
+fi
+
+# --- foreground worker (`claude -p`) ----------------------------------------
 envs=(DS_INBOX="$inbox" DS_INBOX_LOG="$DS_RUNS_DIR/$run_id.inbox.log"
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
 if [ -n "${DS_BASE_URL:-}" ]; then
@@ -140,8 +335,11 @@ echo $$ > "$DS_RUNS_DIR/$run_id.pid"
 trap 'rm -f "$DS_RUNS_DIR/$run_id.pid"' EXIT
 printf '%s\t%s\t%s\n' "$name" "$task" "$report" > "$DS_RUNS_DIR/$run_id.meta"
 
-env "${envs[@]}" perl -e 'alarm shift; exec @ARGV' "$timeout" "${DS_CLAUDE_BIN:-claude}" "${args[@]}" \
-  < "$task" > "$log" 2> "$DS_RUNS_DIR/$run_id.err"
+{
+  [ -z "$ctxnote$clonenote" ] || printf '%s\n\n' "$ctxnote $clonenote"
+  cat "$task"
+} | env "${envs[@]}" perl -e 'alarm shift; exec @ARGV' "$timeout" "${DS_CLAUDE_BIN:-claude}" "${args[@]}" \
+  > "$log" 2> "$DS_RUNS_DIR/$run_id.err"
 code=$?
 echo "$code" > "$DS_RUNS_DIR/$run_id.exit"
 rm -f "$DS_RUNS_DIR/$run_id.pid"

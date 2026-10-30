@@ -14,8 +14,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         if: runner.os == 'Linux'
-        run: shellcheck -x bin/ds bin/ds-say bin/ds-status libexec/ds-inbox-hook libexec/ds-common.sh install.sh tests/run.sh tests/fake-claude
+        run: shellcheck -x bin/ds bin/ds-say bin/ds-status bin/ds-wait libexec/ds-inbox-hook libexec/ds-common.sh libexec/ds-key-helper libexec/ds-watchdog install.sh tests/run.sh tests/fake-claude
       - name: python syntax
-        run: python3 -m py_compile libexec/ds_status.py
+        run: python3 -m py_compile libexec/ds_status.py libexec/ds_chat.py libexec/ds_wait.py
       - name: tests
         run: bash tests/run.sh

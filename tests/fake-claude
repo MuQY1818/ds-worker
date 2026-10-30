@@ -1,7 +1,136 @@
 #!/usr/bin/env bash
-# Stand-in for the claude CLI used by the tests. It checks the arguments ds passes,
-# runs the registered PostToolUse hook once (as Claude Code would after a tool call),
-# and writes a small stream-json transcript.
+# Stand-in for the claude CLI used by the tests.
+#   fake-claude --settings F ... -p     the old print mode: run the PostToolUse hook
+#                                       once and write a small stream-json transcript
+#   fake-claude --bg -n NAME --settings F PROMPT
+#                                       start a "background session": record it in
+#                                       $FAKE_CLAUDE_STATE and return at once
+#   fake-claude agents --json           list the recorded sessions
+#   fake-claude stop ID                 drop a session (what `claude stop` does)
+#   fake-claude done NAME               mark a session idle, as if it had finished
+#   fake-claude gone NAME               forget a session entirely
+#   fake-claude --help                  advertise --bg unless FAKE_CLAUDE_NO_BG is set
+set -u
+state="${FAKE_CLAUDE_STATE:-${TMPDIR:-/tmp}/fake-claude-state}"
+mkdir -p "$state"
+[ -z "${FAKE_CLAUDE_ARGS:-}" ] || printf '%s\n' "$@" > "$FAKE_CLAUDE_ARGS"
+
+# Run the settings' PostToolUse hook with an empty payload and print what it delivered.
+delivered() {
+  local hook_cmd out
+  hook_cmd="$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["hooks"]["PostToolUse"][0]["hooks"][0]["command"])' "$1")"
+  out="$(echo '{}' | eval "$hook_cmd")"
+  python3 -c 'import json, sys
+raw = sys.argv[1].strip()
+print(json.loads(raw)["hookSpecificOutput"]["additionalContext"] if raw else "")' "$out"
+}
+
+# A transcript as Claude Code would have written it under ~/.claude/projects.
+write_transcript() {
+  local path="$1" sid="$2" said="$3"
+  mkdir -p "$(dirname "$path")"
+  python3 - "$path" "$sid" "$said" <<'PY'
+import json, sys
+path, sid, said = sys.argv[1:4]
+from_main = {"type": "assistant", "session_id": sid, "message": {
+    "content": [{"type": "text", "text": "working on it"}],
+    "usage": {"input_tokens": 10, "output_tokens": 20,
+              "cache_read_input_tokens": 30, "cache_creation_input_tokens": 40}}}
+last = {"type": "assistant", "session_id": sid, "message": {
+    "content": [{"type": "text", "text": "inbox: " + (said.replace("\n", " ") or "(empty)")}],
+    "usage": {"input_tokens": 1, "output_tokens": 2,
+              "cache_read_input_tokens": 3, "cache_creation_input_tokens": 4}}}
+with open(path, "w", encoding="utf-8") as f:
+    for event in (from_main, last):
+        f.write(json.dumps(event) + "\n")
+PY
+}
+
+case "${1:-}" in
+  -h|--help)
+    echo "Usage: claude [options] [command] [prompt]"
+    echo "  -p, --print   print mode"
+    [ -n "${FAKE_CLAUDE_NO_BG:-}" ] || echo "  --bg, --background   start the session in the background and return immediately"
+    exit 0 ;;
+  agents)
+    [ "${2:-}" = --json ] || { echo "fake-claude: agents needs --json" >&2; exit 3; }
+    python3 - "$state" <<'PY'
+import glob, json, os, sys
+state = sys.argv[1]
+out = []
+for path in sorted(glob.glob(os.path.join(state, "*.json"))):
+    try:
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        continue
+    done = os.path.exists(os.path.join(state, rec["id"] + ".done"))
+    out.append({"pid": rec["pid"], "id": rec["id"], "cwd": rec["cwd"],
+                "kind": "background", "sessionId": rec["sessionId"],
+                "name": rec["name"], "status": "idle" if done else "busy"})
+print(json.dumps(out, indent=2))
+PY
+    exit 0 ;;
+  stop)
+    id="${2:-}"
+    printf '%s\n' "$id" >> "${FAKE_CLAUDE_STOP_LOG:-$state/stopped.log}"
+    rm -f "$state/$id.json"
+    echo "stopped $id"
+    exit 0 ;;
+  done|gone)
+    python3 - "$state" "${2:-}" "$1" <<'PY'
+import glob, json, os, sys
+state, name, what = sys.argv[1:4]
+for path in glob.glob(os.path.join(state, "*.json")):
+    try:
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        continue
+    if rec.get("name") != name:
+        continue
+    if what == "done":
+        open(os.path.join(state, rec["id"] + ".done"), "w").close()
+    else:
+        os.remove(path)
+PY
+    exit 0 ;;
+  --bg)
+    shift
+    name=""; settings=""; prompt=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -n|--name) name="$2"; shift 2 ;;
+        --settings) settings="$2"; shift 2 ;;
+        --model|--effort|--permission-mode|--append-system-prompt) shift 2 ;;
+        *) prompt="$1"; shift ;;
+      esac
+    done
+    [ -n "$settings" ] || { echo "fake-claude: no --settings" >&2; exit 3; }
+    [ -n "$prompt" ] || { echo "fake-claude: empty prompt" >&2; exit 3; }
+    [ -n "$name" ] || name="unnamed"
+    id="$(python3 -c 'import hashlib, os, sys, time
+print(hashlib.sha1((sys.argv[1] + str(os.getpid()) + str(time.time())).encode()).hexdigest()[:8])' "$name")"
+    session="$id-0000-4000-8000-000000000000"
+    python3 - "$state/$id.json" "$name" "$id" "$session" "$$" "$PWD" <<'PY'
+import json, sys
+out, name, sid, session, pid, cwd = sys.argv[1:7]
+json.dump({"name": name, "id": sid, "sessionId": session,
+           "pid": int(pid), "cwd": cwd}, open(out, "w"))
+PY
+    transcript="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/-fake/$session.jsonl"
+    if [ -n "${FAKE_CLAUDE_WAIT_FOR:-}" ]; then
+      # Let the test queue an inbox message before the worker "does a tool call".
+      ( for _ in $(seq 1 100); do [ -e "$FAKE_CLAUDE_WAIT_FOR" ] && break; sleep 0.1; done
+        write_transcript "$transcript" "$session" "$(delivered "$settings")" ) &
+    else
+      write_transcript "$transcript" "$session" "$(delivered "$settings")"
+    fi
+    echo "background session $id ($name) started"
+    exit 0 ;;
+esac
+
 settings=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -12,19 +141,16 @@ done
 [ -n "$settings" ] || { echo "fake-claude: no --settings" >&2; exit 3; }
 task="$(cat)"
 [ -n "$task" ] || { echo "fake-claude: empty task on stdin" >&2; exit 3; }
+[ -z "${FAKE_CLAUDE_STDIN:-}" ] || printf '%s\n' "$task" > "$FAKE_CLAUDE_STDIN"
 
 # Optional pause so a test can queue a message while the "worker" runs.
 [ -z "${FAKE_CLAUDE_WAIT_FOR:-}" ] || {
   for _ in $(seq 1 50); do [ -e "$FAKE_CLAUDE_WAIT_FOR" ] && break; sleep 0.1; done
 }
 
-hook_cmd="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["hooks"]["PostToolUse"][0]["hooks"][0]["command"])' "$settings")"
-hook_out="$(echo '{}' | eval "$hook_cmd")"
-delivered="$(python3 -c 'import json,sys
-s=sys.argv[1]
-print(json.loads(s)["hookSpecificOutput"]["additionalContext"] if s else "")' "$hook_out")"
+said="$(delivered "$settings")"
 
-python3 - "$delivered" <<'PY'
+python3 - "$said" <<'PY'
 import json, sys
 delivered = sys.argv[1]
 events = [
