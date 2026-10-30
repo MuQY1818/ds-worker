@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# ds-status — list worker runs, or show / follow one of them.
+self="$0"
+while [ -h "$self" ]; do
+  d="$(cd -P "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  case "$self" in /*) ;; *) self="$d/$self" ;; esac
+done
+DS_HOME="$(cd -P "$(dirname "$self")/.." && pwd)"
+# shellcheck source=libexec/ds-common.sh
+. "$DS_HOME/libexec/ds-common.sh"
+
+case "${1:-}" in
+  ""|-a|--all) exec python3 "$DS_HOME/libexec/ds_status.py" --runs "$DS_RUNS_DIR" list "$@" ;;
+  -h|--help)
+    cat <<'EOF'
+Usage: ds-status                  list recent runs (-a for all)
+       ds-status <worker|run> [-n N] [-f]
+                                  show the last N events of a run; -f follows it live
+EOF
+    ;;
+  *) exec python3 "$DS_HOME/libexec/ds_status.py" --runs "$DS_RUNS_DIR" show "$@" ;;
+esac

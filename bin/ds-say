@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# ds-say — send a message to a running worker. It arrives after the worker's next
+# tool call, or when the worker tries to finish.
+set -o pipefail
+
+self="$0"
+while [ -h "$self" ]; do
+  d="$(cd -P "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  case "$self" in /*) ;; *) self="$d/$self" ;; esac
+done
+DS_HOME="$(cd -P "$(dirname "$self")/.." && pwd)"
+# shellcheck source=libexec/ds-common.sh
+. "$DS_HOME/libexec/ds-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: ds-say <worker> <message...>
+       ds-say <worker> -          read the message from stdin
+
+<worker> is the worker name: the task file name without extension, or --name.
+EOF
+}
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+[ $# -ge 2 ] || { usage >&2; exit 2; }
+name="$(ds_name "$1")"; shift
+if [ "$1" = - ]; then msg="$(cat)"; else msg="$*"; fi
+[ -n "$msg" ] || ds_die "empty message"
+
+running=0
+for p in "$DS_RUNS_DIR/$name".*.pid; do
+  [ -f "$p" ] && kill -0 "$(cat "$p")" 2>/dev/null && running=1
+done
+[ $running -eq 1 ] || printf 'ds-say: no running worker named %s; the message waits in its inbox\n' "$name" >&2
+
+mkdir -p "$DS_INBOX_DIR"
+printf '%s\n' "$msg" >> "$DS_INBOX_DIR/$name.md"
+echo "queued for $name (delivered after its next tool call)"

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Inbox hook, registered by ds. If the worker's inbox ($DS_INBOX) holds a message,
+# hand it to the worker and clear the inbox.
+#   PostToolUse: the message is added to the worker's context after the tool call.
+#   Stop:        the worker is kept running so it can act on the message first.
+event="${1:-PostToolUse}"
+cat > /dev/null   # the hook's JSON payload on stdin is not needed
+
+inbox="${DS_INBOX:-}"
+[ -n "$inbox" ] && [ -s "$inbox" ] || exit 0
+
+# Claim the inbox atomically, so a message written meanwhile waits for the next call.
+claimed="$inbox.claimed.$$"
+mv "$inbox" "$claimed" 2>/dev/null || exit 0
+
+python3 - "$event" "$claimed" "${DS_INBOX_LOG:-}" "${DS_INBOX_HEADER:-[Message from the dispatcher]}" <<'PY'
+import json, sys, time
+event, path, log, header = sys.argv[1:5]
+msg = open(path, encoding="utf-8").read().strip()
+text = f"{header}\n{msg}"
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "event": event, "message": msg}, ensure_ascii=False) + "\n")
+if event == "Stop":
+    out = {"decision": "block", "reason": text}
+else:
+    out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}
+print(json.dumps(out, ensure_ascii=False))
+PY
+rm -f "$claimed"

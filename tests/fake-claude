@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Stand-in for the claude CLI used by the tests. It checks the arguments ds passes,
+# runs the registered PostToolUse hook once (as Claude Code would after a tool call),
+# and writes a small stream-json transcript.
+settings=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --settings) settings="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$settings" ] || { echo "fake-claude: no --settings" >&2; exit 3; }
+task="$(cat)"
+[ -n "$task" ] || { echo "fake-claude: empty task on stdin" >&2; exit 3; }
+
+# Optional pause so a test can queue a message while the "worker" runs.
+[ -z "${FAKE_CLAUDE_WAIT_FOR:-}" ] || {
+  for _ in $(seq 1 50); do [ -e "$FAKE_CLAUDE_WAIT_FOR" ] && break; sleep 0.1; done
+}
+
+hook_cmd="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["hooks"]["PostToolUse"][0]["hooks"][0]["command"])' "$settings")"
+hook_out="$(echo '{}' | eval "$hook_cmd")"
+delivered="$(python3 -c 'import json,sys
+s=sys.argv[1]
+print(json.loads(s)["hookSpecificOutput"]["additionalContext"] if s else "")' "$hook_out")"
+
+python3 - "$delivered" <<'PY'
+import json, sys
+delivered = sys.argv[1]
+events = [
+    {"type": "system", "subtype": "init", "session_id": "fake-session"},
+    {"type": "assistant", "session_id": "fake-session", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "echo hello"}}]}},
+    {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "hello"}]}},
+    {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "inbox: " + (delivered.replace("\n", " ") or "(empty)")}]}},
+    {"type": "result", "subtype": "success", "is_error": False, "num_turns": 2,
+     "duration_ms": 1500, "session_id": "fake-session", "result": "report written"},
+]
+for e in events:
+    print(json.dumps(e))
+PY

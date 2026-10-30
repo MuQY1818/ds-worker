@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# ds — hand a task sheet to a headless Claude Code worker.
+set -o pipefail
+
+self="$0"
+while [ -h "$self" ]; do
+  d="$(cd -P "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  case "$self" in /*) ;; *) self="$d/$self" ;; esac
+done
+DS_HOME="$(cd -P "$(dirname "$self")/.." && pwd)"
+# shellcheck source=libexec/ds-common.sh
+. "$DS_HOME/libexec/ds-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: ds <task.md> <report.md> [options]
+
+Run a headless Claude Code worker on a task sheet. The worker writes its
+report to <report.md>. Talk to it while it runs with `ds-say`, watch it
+with `ds-status`.
+
+Options:
+  --bg               run detached and return immediately
+  --name NAME        worker name for ds-say / ds-status (default: task file name)
+  --model MODEL      model id (default: $DS_MODEL)
+  --effort LEVEL     low | medium | high (default: $DS_EFFORT, else high)
+  --timeout SECS     hard wall-clock limit (default: $DS_TIMEOUT, else 7200)
+  --rules FILE       extra rules appended to the worker's system prompt
+  --resume SESSION   continue an earlier worker session; the task sheet
+                     is sent as the next message
+  -h, --help         show this help
+EOF
+}
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+[ $# -ge 2 ] || { usage >&2; exit 2; }
+task="$1"; report="$2"; shift 2
+
+bg=0
+name=""
+model="${DS_MODEL:-}"
+effort="${DS_EFFORT:-high}"
+timeout="${DS_TIMEOUT:-7200}"
+rules_file=""
+resume=""
+passthru=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bg) bg=1; shift; continue ;;
+    -h|--help) usage; exit 0 ;;
+    --name|--model|--effort|--timeout|--rules|--resume)
+      [ $# -ge 2 ] || ds_die "$1 needs a value"
+      case "$1" in
+        --name) name="$2" ;;
+        --model) model="$2" ;;
+        --effort) effort="$2" ;;
+        --timeout) timeout="$2" ;;
+        --rules) rules_file="$2" ;;
+        --resume) resume="$2" ;;
+      esac
+      passthru+=("$1" "$2"); shift 2 ;;
+    *) ds_die "unknown option: $1 (see ds --help)" ;;
+  esac
+done
+
+[ -f "$task" ] || ds_die "task sheet not found: $task"
+case "$effort" in low|medium|high) ;; *) ds_die "--effort must be low, medium or high" ;; esac
+case "$timeout" in ''|*[!0-9]*) ds_die "--timeout must be a whole number of seconds" ;; esac
+[ -z "$rules_file" ] || [ -f "$rules_file" ] || ds_die "rules file not found: $rules_file"
+[ -z "${DS_RULES_FILE:-}" ] || [ -f "$DS_RULES_FILE" ] || ds_die "DS_RULES_FILE not found: $DS_RULES_FILE"
+if [ -n "${DS_BASE_URL:-}" ] && [ -z "${DS_AUTH_TOKEN:-}" ]; then
+  ds_die "DS_BASE_URL is set but DS_AUTH_TOKEN is empty (see config.example.env)"
+fi
+
+task="$(cd "$(dirname "$task")" && pwd)/$(basename "$task")"
+case "$report" in /*) ;; *) report="$PWD/$report" ;; esac
+[ -n "$name" ] || name="$(ds_name "$task")"
+run_id="${DS_RUN_ID:-$name.$(date +%Y%m%d-%H%M%S)}"
+mkdir -p "$DS_RUNS_DIR" "$DS_INBOX_DIR"
+log="$DS_RUNS_DIR/$run_id.jsonl"
+inbox="$DS_INBOX_DIR/$name.md"
+
+if [ $bg -eq 1 ]; then
+  rm -f "$inbox"   # messages left from an earlier run are not for this worker
+  DS_RUN_ID="$run_id" DS_KEEP_INBOX=1 nohup "$self" "$task" "$report" "${passthru[@]}" \
+    > "$DS_RUNS_DIR/$run_id.out" 2>&1 < /dev/null &
+  printf 'started  %s  (run %s, pid %s)\n' "$name" "$run_id" "$!"
+  printf '  log    %s\n' "$log"
+  printf '  talk   ds-say %s "..."\n' "$name"
+  printf '  watch  ds-status %s -f\n' "$name"
+  exit 0
+fi
+[ -n "${DS_KEEP_INBOX:-}" ] || rm -f "$inbox"
+
+rules="You are a worker executing a task sheet. Follow it; do not re-plan or widen its scope.
+1. Before you finish, write your report to: $report. List the key commands you ran, the files you produced, and anything that failed or was skipped, with the reason.
+2. Report truthfully. A failure is a failure: never invent numbers or claim to have run something you did not. Mark anything you could not verify as unverified.
+3. Do not delete or overwrite files that this task did not create.
+4. Messages headed \"[Message from the dispatcher]\" may arrive while you work. They take priority over your current plan."
+for f in "${DS_RULES_FILE:-}" "$rules_file"; do
+  [ -n "$f" ] || continue
+  rules="$rules
+
+$(cat "$f")"
+done
+
+# Register the inbox hook: after every tool call, and when the worker tries to stop.
+settings="$(python3 - "$DS_HOME/libexec/ds-inbox-hook" <<'PY'
+import json, shlex, sys
+hook = shlex.quote(sys.argv[1])
+def cmd(event):
+    return {"type": "command", "command": f"{hook} {event}"}
+print(json.dumps({"hooks": {
+    "PostToolUse": [{"matcher": "*", "hooks": [cmd("PostToolUse")]}],
+    "Stop": [{"hooks": [cmd("Stop")]}],
+}}))
+PY
+)" || ds_die "python3 is required"
+
+envs=(DS_INBOX="$inbox" DS_INBOX_LOG="$DS_RUNS_DIR/$run_id.inbox.log"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
+if [ -n "${DS_BASE_URL:-}" ]; then
+  envs+=(ANTHROPIC_BASE_URL="$DS_BASE_URL" ANTHROPIC_AUTH_TOKEN="$DS_AUTH_TOKEN" ANTHROPIC_API_KEY=)
+fi
+if [ -n "$model" ]; then
+  for v in ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL \
+           ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do
+    envs+=("$v=$model")
+  done
+fi
+
+args=(-p --output-format stream-json --verbose
+      --permission-mode "${DS_PERMISSION_MODE:-bypassPermissions}"
+      --effort "$effort" --settings "$settings" --append-system-prompt "$rules")
+[ -z "$model" ] || args+=(--model "$model")
+[ -z "$resume" ] || args+=(--resume "$resume")
+
+echo $$ > "$DS_RUNS_DIR/$run_id.pid"
+trap 'rm -f "$DS_RUNS_DIR/$run_id.pid"' EXIT
+printf '%s\t%s\t%s\n' "$name" "$task" "$report" > "$DS_RUNS_DIR/$run_id.meta"
+
+env "${envs[@]}" perl -e 'alarm shift; exec @ARGV' "$timeout" "${DS_CLAUDE_BIN:-claude}" "${args[@]}" \
+  < "$task" > "$log" 2> "$DS_RUNS_DIR/$run_id.err"
+code=$?
+echo "$code" > "$DS_RUNS_DIR/$run_id.exit"
+rm -f "$DS_RUNS_DIR/$run_id.pid"
+python3 "$DS_HOME/libexec/ds_status.py" --runs "$DS_RUNS_DIR" summary "$run_id"
+exit $code
